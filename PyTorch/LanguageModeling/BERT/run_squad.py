@@ -35,7 +35,7 @@ from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
-from apex import amp
+###from apex import amp
 from schedulers import LinearWarmUpScheduler
 from file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 import modeling
@@ -43,6 +43,11 @@ from optimization import BertAdam, warmup_linear
 from tokenization import (BasicTokenizer, BertTokenizer, whitespace_tokenize)
 from utils import is_main_process, format_step
 import dllogger, time
+
+try:
+    import musa_torch_extension
+except ModuleNotFoundError:
+    print("Import musa_torch_extension failed.")
 
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
@@ -698,7 +703,7 @@ def _compute_softmax(scores):
     return probs
 
 
-
+'''
 from apex.multi_tensor_apply import multi_tensor_applier
 class GradientClipper:
     """
@@ -722,7 +727,7 @@ class GradientClipper:
         clip_coef = self.max_norm / (total_norm + 1e-6)
         if clip_coef < 1:
             multi_tensor_applier(self.multi_tensor_scale, self._overflow_buf, [l, l], clip_coef)
-
+'''
 
 def main():
     parser = argparse.ArgumentParser()
@@ -859,8 +864,9 @@ def main():
     args.fp16 = args.fp16 or args.amp
 
     if args.local_rank == -1 or args.no_cuda:
-        device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-        n_gpu = torch.cuda.device_count()
+        #device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+        device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "mtgpu")
+        n_gpu = 1
     else:
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
@@ -886,6 +892,7 @@ def main():
 
     print("device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
                                 device, n_gpu, bool(args.local_rank != -1), args.fp16))
+    print('\n')
 
     dllogger.log(step="PARAMETER", data={"Config": [str(args)]})
 
@@ -948,6 +955,7 @@ def main():
     model.load_state_dict(checkpoint, strict=False)
     dllogger.log(step="PARAMETER", data={"loaded_checkpoint": True})
     model.to(device)
+    
     num_weights = sum([p.numel() for p in model.parameters() if p.requires_grad])
     dllogger.log(step="PARAMETER", data={"model_weights_num":num_weights})
 
@@ -964,6 +972,8 @@ def main():
         {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
     if args.do_train:
+
+        ### not use this !!!
         if args.fp16:
             try:
                 from apex.optimizers import FusedAdam
@@ -1048,9 +1058,9 @@ def main():
         train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size * n_gpu)
 
         model.train()
-        gradClipper = GradientClipper(max_grad_norm=1.0)
+        ###gradClipper = GradientClipper(max_grad_norm=1.0)  #this will import amp_C
         final_loss = None
-
+    
         train_start = time.time()
         for epoch in range(int(args.num_train_epochs)):
             train_iter = tqdm(train_dataloader, desc="Iteration", disable=args.disable_progress_bar) if is_main_process() else train_dataloader
@@ -1064,6 +1074,7 @@ def main():
                     batch = tuple(t.to(device) for t in batch)  # multi-gpu does scattering it-self
                 input_ids, input_mask, segment_ids, start_positions, end_positions = batch
                 start_logits, end_logits = model(input_ids, segment_ids, input_mask)
+                
                 # If we are on multi-GPU, split add a dimension
                 if len(start_positions.size()) > 1:
                     start_positions = start_positions.squeeze(-1)
@@ -1077,6 +1088,9 @@ def main():
                 loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignored_index)
                 start_loss = loss_fct(start_logits, start_positions)
                 end_loss = loss_fct(end_logits, end_positions)
+                print('info result shape:', start_logits.shape, start_positions.shape)
+                
+                
                 loss = (start_loss + end_loss) / 2
                 if n_gpu > 1:
                     loss = loss.mean()  # mean() to average on multi-gpu.
@@ -1089,12 +1103,13 @@ def main():
                     loss.backward()
 
                 # gradient clipping
-                gradClipper.step(amp.master_params(optimizer))
+                ###gradClipper.step(amp.master_params(optimizer))
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
                 if (step + 1) % args.gradient_accumulation_steps == 0:
-                    if args.fp16 :
-                        # modify learning rate with special warm up for BERT which FusedAdam doesn't do
-                        scheduler.step()
+                    # if args.fp16 :
+                    #     # modify learning rate with special warm up for BERT which FusedAdam doesn't do
+                    #     scheduler.step()
                     optimizer.step()
                     optimizer.zero_grad()
                     global_step += 1
